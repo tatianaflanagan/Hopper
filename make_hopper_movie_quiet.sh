@@ -2,23 +2,18 @@
 set -euo pipefail
 start_time=$(date +%s)
 # Usage:
-#   ./make_hopper_movie_quiet.sh INPUT_DIR OUTPUT_MOVIE [NOTEBOOK] [FPS]
+#   ./make_hopper_movie_quiet.sh INPUT_DIR OUTPUT_MOVIE [NOTEBOOK] [FPS] [STRIDE]
+#
+# STRIDE: use every Nth timestep (default 1 = every timestep).
 #
 # Example:
-#  
-#./make_hopper_movie_quiet.sh \
-#    ./dumps \
-#    hopper_movie.mp4 \
-#    ./2DHopperForces.ipynb \
-#    10
-
-# If you don't want the movie to open automatically at the end:
+#
 #./make_hopper_movie_quiet.sh \
 #    ./dumps \
 #    hopper_movie.mp4 \
 #    ./2DHopperForces.ipynb \
 #    10 \
-#    no
+#    5
 
 #Defaults
 #./make_hopper_movie_quiet.sh
@@ -27,11 +22,13 @@ start_time=$(date +%s)
 #Output movie: hopper_movie.mp4
 #Notebook: 2DHopperForces.ipynb
 #FPS: 10
+#Stride: 1
 
 INPUT_DIR="${1:-.}" #use arg number 1 if it exists, otherwise, use .
 OUTPUT_MOVIE="${2:-hopper_movie.mp4}" #same idea
 NOTEBOOK="${3:-2DHopperForces.ipynb}" #same idea
 FPS="${4:-10}" #same idea
+STRIDE="${5:-1}" #same idea
 
 #eliminating "file not found" errors:
 INPUT_DIR="$(cd "$INPUT_DIR" && pwd)"
@@ -71,14 +68,37 @@ RUN_NOTEBOOK="$RUN_DIR/$(basename "$NOTEBOOK")"
 cp "$NOTEBOOK" "$RUN_NOTEBOOK"
 
 frame_number=0
-total_frames=$(find "$INPUT_DIR" -maxdepth 1 -type f -name "*.dump" | wc -l | tr -d ' ')
+
+# Count total frames = sum of timesteps across all .dump/.forces pairs
+total_frames=0
+found_any_dump=0
+for particle_file in "$INPUT_DIR"/*.dump; do
+    [[ -e "$particle_file" ]] || continue
+    found_any_dump=1
+    base="${particle_file%.dump}"
+    contact_file="${base}.forces"
+    [[ -f "$contact_file" ]] || continue
+    n=$(python3 -c "
+import sys
+count = sum(1 for line in open(sys.argv[1]) if line.startswith('ITEM: TIMESTEP'))
+print(count)
+" "$particle_file")
+    total_frames=$((total_frames + (n + STRIDE - 1) / STRIDE))
+done
+
+if (( found_any_dump == 0 )); then
+    echo "Error: no .dump files found in $INPUT_DIR" >&2
+    exit 1
+fi
+
+if (( total_frames == 0 )); then
+    echo "Error: no complete .dump/.forces pairs found in $INPUT_DIR" >&2
+    exit 1
+fi
 
 for particle_file in "$INPUT_DIR"/*.dump; do
-    
-    [[ -e "$particle_file" ]] || {
-        echo "Error: no .dump files found in $INPUT_DIR" >&2
-        exit 1
-    }
+
+    [[ -e "$particle_file" ]] || continue
 
     base="${particle_file%.dump}"
     contact_file="${base}.forces"
@@ -88,85 +108,96 @@ for particle_file in "$INPUT_DIR"/*.dump; do
         continue
     fi
 
-    frame_png=$(printf '%s/frame_%06d.png' "$FRAME_DIR" "$frame_number")
+    n_timesteps=$(python3 -c "
+import sys
+count = sum(1 for line in open(sys.argv[1]) if line.startswith('ITEM: TIMESTEP'))
+print(count)
+" "$particle_file")
 
-    python3 - "$RUN_DIR/config.py"         "$particle_file" "$contact_file" "$frame_png" <<'PYCONFIG'
+    for ((ts_idx=0; ts_idx<n_timesteps; ts_idx+=STRIDE)); do
+
+        frame_png=$(printf '%s/frame_%06d.png' "$FRAME_DIR" "$frame_number")
+
+        python3 - "$RUN_DIR/config.py" "$particle_file" "$contact_file" "$frame_png" "$ts_idx" <<'PYCONFIG'
 import sys
 from pathlib import Path
 
-config_path, particle_file, contact_file, output_png = sys.argv[1:]
+config_path, particle_file, contact_file, output_png, timestep_index = sys.argv[1:]
 
 text = (
     "from pathlib import Path\n\n"
     f"PARTICLE_FILE = Path({str(Path(particle_file).resolve())!r})\n"
     f"CONTACT_FILE = Path({str(Path(contact_file).resolve())!r})\n"
     f"OUTPUT_PNG = Path({str(Path(output_png).resolve())!r})\n"
+    f"TIMESTEP_INDEX = {int(timestep_index)}\n"
 )
 
 Path(config_path).write_text(text, encoding="utf-8")
 PYCONFIG
 
-    #echo "Frame $frame_number: $(basename "$particle_file")"
-    printf "[%d/%d] Rendering %s\n" \
-        "$((frame_number + 1))" \
-        "$total_frames" \
-        "$(basename "$particle_file")"
+        printf "[%d/%d] Rendering %s (timestep index %d)\n" \
+            "$((frame_number + 1))" \
+            "$total_frames" \
+            "$(basename "$particle_file")" \
+            "$ts_idx"
 
-    executed_name="executed_${frame_number}.ipynb"
+        executed_name="executed_${frame_number}.ipynb"
 
-    (
-        cd "$RUN_DIR"
+        (
+            cd "$RUN_DIR"
 
-        if ! jupyter nbconvert \
-            --to notebook \
-            --execute "$RUN_NOTEBOOK" \
-            --output "$executed_name" \
-            --output-dir "$WORK_DIR" \
-            --ExecutePreprocessor.timeout=-1 \
-            --log-level=ERROR \
-            >/dev/null
-        then
-            echo "Error: notebook execution failed for:" >&2
-            echo "       $(basename "$particle_file")" >&2
+            if ! jupyter nbconvert \
+                --to notebook \
+                --execute "$RUN_NOTEBOOK" \
+                --output "$executed_name" \
+                --output-dir "$WORK_DIR" \
+                --ExecutePreprocessor.timeout=-1 \
+                --log-level=ERROR \
+                >/dev/null
+            then
+                echo "Error: notebook execution failed for:" >&2
+                echo "       $(basename "$particle_file") timestep index $ts_idx" >&2
+                exit 1
+            fi
+        )
+
+        if [[ ! -s "$frame_png" ]]; then
+            echo "Error: notebook did not create $frame_png" >&2
+            echo "Check that the notebook imports OUTPUT_PNG from config.py" >&2
+            echo "and passes save_path=OUTPUT_PNG to the plotting function." >&2
             exit 1
         fi
-    )
 
-    if [[ ! -s "$frame_png" ]]; then
-        echo "Error: notebook did not create $frame_png" >&2
-        echo "Check that the notebook imports OUTPUT_PNG from config.py" >&2
-        echo "and passes save_path=OUTPUT_PNG to the plotting function." >&2
-        exit 1
-    fi
+        frame_number=$((frame_number + 1))
 
-    frame_number=$((frame_number + 1))
+        #Add ETA after each frame
+        current_time=$(date +%s)
+        elapsed_so_far=$((current_time - start_time))
 
-    #Add ETA after each frame
-    current_time=$(date +%s)
-    elapsed_so_far=$((current_time - start_time))
+        average_seconds=$(awk "BEGIN {
+            if ($frame_number > 0)
+                printf \"%.2f\", $elapsed_so_far / $frame_number
+            else
+                printf \"0\"
+        }")
 
-    average_seconds=$(awk "BEGIN {
-        if ($frame_number > 0)
-            printf \"%.2f\", $elapsed_so_far / $frame_number
-        else
-            printf \"0\"
-    }")
+        remaining_frames=$((total_frames - frame_number))
 
-    remaining_frames=$((total_frames - frame_number))
+        eta_seconds=$(awk "BEGIN {
+            printf \"%.0f\", $average_seconds * $remaining_frames
+        }")
 
-    eta_seconds=$(awk "BEGIN {
-        printf \"%.0f\", $average_seconds * $remaining_frames
-    }")
+        eta_hours=$((eta_seconds / 3600))
+        eta_minutes=$(((eta_seconds % 3600) / 60))
+        eta_secs=$((eta_seconds % 60))
 
-    eta_hours=$((eta_seconds / 3600))
-    eta_minutes=$(((eta_seconds % 3600) / 60))
-    eta_secs=$((eta_seconds % 60))
+        printf "        Average: %s s/frame | ETA: %02d:%02d:%02d\n" \
+            "$average_seconds" \
+            "$eta_hours" \
+            "$eta_minutes" \
+            "$eta_secs"
 
-    printf "        Average: %s s/frame | ETA: %02d:%02d:%02d\n" \
-        "$average_seconds" \
-        "$eta_hours" \
-        "$eta_minutes" \
-        "$eta_secs"
+    done
 done
 
 if (( frame_number == 0 )); then
