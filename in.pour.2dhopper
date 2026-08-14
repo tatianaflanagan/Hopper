@@ -1,0 +1,94 @@
+# pour two types of particles (cohesive and non-cohesive) on flat wall
+
+#variable        mus equal 0.3 # rolling friction
+#variable        wallmus equal 0.3 # rolling friction
+#variable        mur equal 0.3 # rolling friction
+#variable        wallmur equal 0.3 # rolling friction
+variable        name string hopper_mur${mur}_mus${mus}_wallmur${wallmur}_wallmus${wallmus}
+
+dimension       2
+atom_style      sphere
+units           lj
+
+###############################################
+# Particle-related parameters
+###############################################
+variable        rlo equal 2.15
+variable        rhi equal 3.15
+variable        dlo equal 2.0*${rlo}
+variable        dhi equal 2.0*${rhi}
+variable        dave equal (${dlo}+${dhi})/2.0
+
+variable        dens equal 0.1
+
+variable skin equal 0.3*${rhi}
+
+###############################################
+# Hopper-related parameters
+###############################################
+variable        boxx equal 50*${dave}
+variable        half_boxx equal ${boxx}
+variable        hopperheight equal 50*${dave}
+variable        boxy equal 2.0*${boxx}
+variable        boxz equal 30
+variable        opening equal 5.0*${dave}
+variable        half_opening equal 0.5*${opening}
+
+
+processors      * * 1
+
+region          boxreg block -${half_boxx} ${half_boxx} 0 ${boxy} -0.5 0.5
+create_box      1 boxreg
+change_box      all boundary f p p
+
+###############################################
+# Contact-related parameters
+###############################################
+pair_style      granular
+
+pair_coeff      1 1 hertz 200.0 20.0 tangential linear_history 3000.0 1.0 ${mus} rolling sds 200.0 100.0 ${mur} twisting marshall
+
+###############################################
+# build hopper
+###############################################
+region          Ahopper plane -${half_opening} 0 0  1 1 0
+region          Bhopper plane  ${half_opening} 0 0 -1 1 0
+region          insreg1 block -${half_boxx} ${half_boxx} ${hopperheight} ${boxy} -0.5 0.5
+
+fix             4 all wall/gran/region granular hertz 200.0 20.0 tangential linear_history 3000.0 1.0 ${wallmus} rolling sds 200.0 100.0 ${wallmur} twisting marshall region Bhopper
+fix             3 all wall/gran/region granular hertz 200.0 20.0 tangential linear_history 3000.0 1.0 ${wallmus} rolling sds 200.0 100.0 ${wallmur} twisting marshall region Ahopper
+
+###############################################
+# Analysis and output
+###############################################
+compute         acontact all contact/atom
+thermo_style    custom step atoms ke
+thermo_modify   lost ignore
+thermo          100
+variable        dump_freq_fabr equal 1000
+
+
+dump           1 all custom 1000 ${name}.dump id type radius mass x y z c_acontact
+#compute         1 all pair/local p4 p8 p9 cutoff radius
+
+compute         2 all property/local patom1 patom2 cutoff radius
+compute         3 all pair/local force fx fy fz p1 p2 p3 p4 p5 p6 cutoff radius
+
+dump            FOR all local ${dump_freq_fabr} ${name}.forces index c_2[1] c_2[2] c_3[1] c_3[2] c_3[3] c_3[4] c_3[5] c_3[6] c_3[8] c_3[9]
+dump_modify     FOR format line "%d %0.0f %0.0f %24.16g %24.16g %24.16g %24.16g %24.16g %24.16g %24.16g %24.16g"
+
+
+###############################################
+# Run the simulation
+###############################################
+comm_modify     vel yes
+
+neighbor        ${skin} bin
+neigh_modify    delay 0 every 1 check yes
+
+fix             1 all nve/sphere disc
+fix             grav all gravity 0.1 vector 0 -1 0
+fix             ins1 all pour 2000 1 3123 region insreg1 diam range ${dlo} ${dhi} dens ${dens} ${dens}
+
+timestep        0.01
+run             600000
